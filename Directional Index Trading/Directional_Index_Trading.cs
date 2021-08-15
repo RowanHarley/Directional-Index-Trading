@@ -52,6 +52,9 @@ namespace Directional_Index_Trading
         [InputParameter("Reward ratio", 0, 1, 100, .5, 1)]
         public double y = 6;
 
+        [InputParameter("Random Number for candle length? ")]
+        public bool RandomTime = false;
+
         [InputParameter("Risk Percent per Trade", 0, 1, 100, .01, 2)]
         public double maxRisk = 2.25;
 
@@ -98,6 +101,7 @@ namespace Directional_Index_Trading
         private DateTime MarketOpen = new DateTime(DateTime.UtcNow.Year, DateTime.UtcNow.Month, DateTime.UtcNow.Day, 22, 0, 0);
         private DateTime LowMovementBegin;
         private DateTime LowMovementFinish;
+        private bool aboveBE = false;
         private double totalPos = 0;
         private double sharpe;
         private double longP = 0;
@@ -161,8 +165,8 @@ namespace Directional_Index_Trading
                 return;
             }
             Random rnd = new Random();
-            rndNum = rnd.Next(1, 180);
-            _historicalSecData = symbol1.GetHistory( new HistoryAggregationHeikenAshi(HeikenAshiSource.Second, rnd.Next(1, 180)), HistoryType.Last ,DateTime.Now.AddMinutes(-30));
+            rndNum = RandomTime == true ? rnd.Next(1, 180) : 87;
+            _historicalSecData = symbol1.GetHistory( new HistoryAggregationHeikenAshi(HeikenAshiSource.Second, rndNum), HistoryType.Last ,DateTime.Now.AddMinutes(-30));
             
             _historicalSecData.AddIndicator(indicatorDMI);
             _historicalSecData.AddIndicator(indicatorATR);
@@ -301,15 +305,15 @@ namespace Directional_Index_Trading
         {
             
 
-            if (Tradesat0Risk > 5)
+            if (Tradesat0Risk > 3)
             {
                 CurrMaxRisk = maxRisk;
                 Tradesat0Risk = 0;
             }
-            else if(Tradesat0Risk <= 5 && CurrMaxRisk <= 0)
+            else if(Tradesat0Risk <= 3 && CurrMaxRisk <= 0)
             {
                 Tradesat0Risk++;
-                Log("Trades stopped");
+                Log("Trades stopped. Not enough 0 risk trades", StrategyLoggingLevel.Error);
                 return;
             }
 
@@ -338,7 +342,8 @@ namespace Directional_Index_Trading
 
             //var orderPrice = (side == Side.Buy) ? symbol1.Bid : symbol1.Ask;
             double orderPrice;
-            orderPrice = Math.Round(((side == Side.Buy ? ((HistoryItemBar)_historicalSecData[1]).Low : ((HistoryItemBar)_historicalSecData[1]).High) + sign * x) * symbol1.TickSize, MidpointRounding.ToEven)/symbol1.TickSize;
+            orderPrice = (side == Side.Buy) ? symbol1.Bid : symbol1.Ask;
+            //orderPrice = Math.Round(((side == Side.Buy ? ((HistoryItemBar)_historicalSecData[1]).Low : ((HistoryItemBar)_historicalSecData[1]).High) + sign * x) * symbol1.TickSize, MidpointRounding.ToEven)/symbol1.TickSize;
             
             Log("Order Price: " + orderPrice);
 
@@ -357,8 +362,6 @@ namespace Directional_Index_Trading
             {
                 Log("Trading failed. 0 Amount size");
                 Stop();
-                //symbol1 = symbol2;
-                //pricePerTick *= 10;
             }
             var StopL = SlTpHolder.CreateSL(slPrice, PriceMeasurement.Offset);
             var TakeP = SlTpHolder.CreateTP(Math.Ceiling(y * slPrice), PriceMeasurement.Offset);
@@ -399,8 +402,7 @@ namespace Directional_Index_Trading
             
 
             trailPrice = Math.Round(orderPrice + sign * slPrice, MidpointRounding.ToEven);
-            CurrOrderPrice = orderPrice;
-            BEPtsAbove = slPrice + PtsAbove;
+            BEPtsAbove = orderPrice + PtsAbove;
             //PtsAbove = slPrice + 10 * symbol1.TickSize;
             numBars = 0;
             var formattedSide = string.Empty;
@@ -429,9 +431,10 @@ namespace Directional_Index_Trading
             {
                 return;
             }
-            if (ChoiceofStop == 2 && symbol1.Last >= CurrOrderPrice + BEPtsAbove)
+            if (ChoiceofStop == 2 && symbol1.Last >= BEPtsAbove && aboveBE == false)
             {
-                trailPrice = CurrOrderPrice + PtsAbove;
+                trailPrice = Core.Positions[0].OpenPrice + 3;
+                aboveBE = true;
             }
             if(Core.Positions.Length > 1)
             {
@@ -440,9 +443,8 @@ namespace Directional_Index_Trading
             }
             foreach (Position pos in Core.Positions)
             {
-                
                 var sign = (pos.Side == Side.Buy) ? -1 : 1;
-                if ((((ChoiceofStop == 0 && symbol1.Last >= CurrOrderPrice + PtsAbove) || ChoiceofStop == 1) && ((pos.Side == Side.Buy && symbol1.Last <= trailPrice) || (pos.Side == Side.Sell && symbol1.Last >= trailPrice))) || (ChoiceofStop == 2 && symbol1.Last == CurrOrderPrice + BEPtsAbove))
+                if ((((ChoiceofStop == 0 && symbol1.Last >= CurrOrderPrice + PtsAbove) || ChoiceofStop == 1) && ((pos.Side == Side.Buy && symbol1.Last <= trailPrice) || (pos.Side == Side.Sell && symbol1.Last >= trailPrice))) || (ChoiceofStop == 2 && aboveBE == true && symbol1.Last <= trailPrice))
                 {
                     TradingOperationResult result = Core.Instance.ClosePosition(new ClosePositionRequestParameters()
                     {
@@ -459,8 +461,8 @@ namespace Directional_Index_Trading
                     //TimeAfterPos = symbol1.LastDateTime.AddMinutes(minutesbeforenew);
 
                 }
-                
-                var trail = Math.Round(symbol1.Last + sign * Math.Max(slPrice, indicatorATR.GetValue()/z), 2);
+                var trail = Math.Round((symbol1.Last + sign * indicatorATR.GetValue()/z)* symbol1.TickSize, MidpointRounding.ToEven)/symbol1.TickSize;
+
                 if ((pos.Side == Side.Buy && trail > trailPrice) || (pos.Side == Side.Sell && trail < trailPrice))
                 {
                     trailPrice = trail;
@@ -515,6 +517,7 @@ namespace Directional_Index_Trading
             {
                 lossStreak++;
                 CurrMaxRisk -= 0.5;
+                Log("Max risk lowered: " + CurrMaxRisk);
             }
             else
             {
