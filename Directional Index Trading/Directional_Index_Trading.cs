@@ -4,14 +4,11 @@ using System;
 using System.Linq;
 using System.Collections.Generic;
 using TradingPlatform.BusinessLayer;
+using System.Threading;
 
 namespace Directional_Index_Trading
 {
-    /// <summary>
-    /// A blank strategy. Add your code, compile it and run via Strategy Runner panel in the assigned trading terminal.
-    /// Information about API you can find here: http://api.quantower.com
-    /// Code samples: https://github.com/Quantower/Examples
-    /// </summary>
+    
     public class Directional_Index_Trading : Strategy
     {
         
@@ -20,8 +17,8 @@ namespace Directional_Index_Trading
         [InputParameter("Micro Symbol", 10)]
         public Symbol symbol1;
 
-        /*[InputParameter("Mini Symbol")]
-        public Symbol symbol2;*/
+        [InputParameter("Mini Symbol")]
+        public Symbol symbol2;
 
         [InputParameter("Account", 20)]
         public Account account;
@@ -45,23 +42,31 @@ namespace Directional_Index_Trading
             "Linear Weighted", MaMode.LWMA}
         )]
         public MaMode MAType = MaMode.SMA;
+
         [InputParameter("How does risk change on losing trade? ", variants: new object[] {
             "Risk Increases", -1,
             "Risk Decreases", 1
         })]
         public int RiskDir = 1;
 
-        [InputParameter("Short Only?")]
-        public bool ShortOnly = false;
+        [InputParameter("Trading Direction", variants: new object[]{
+            "Long & Short", 0,
+            "Long Only", 1,
+            "Short Only", 2
+        })]
+        public int TradeDir = 0;
 
         [InputParameter("Reward ratio", 0, 1, 100, .5, 1)]
-        public double y = 6;
+        public double y = 3;
 
+        [InputParameter("Hours of no trading after 9:30pm", minimum: 2, maximum: 22)]
+        public int hoursWithoutTrading = 15;
+        
         [InputParameter("Random Number for candle length? ")]
         public bool RandomTime = false;
 
         [InputParameter("Risk Percent per Trade", 0, 1, 100, .01, 2)]
-        public double maxRisk = 2.25;
+        public double maxRisk = 2;
 
         [InputParameter("TIF", 5)]
         public TimeInForce time = TimeInForce.GTT;
@@ -73,7 +78,7 @@ namespace Directional_Index_Trading
         public double z = 1;
 
         [InputParameter("Candle Time if not Random", 0, 1, 1000)]
-        public int CandleTime;
+        public int CandleTime = 156;
 
         [InputParameter("Choice of Lower close method", variants: new object[] {
             "Start Stop Loss X points above order price", 0,
@@ -81,7 +86,7 @@ namespace Directional_Index_Trading
             "Breakeven with TP", 2,
             "Let Winners run", 3}
         )]
-        public int ChoiceofStop;
+        public int ChoiceofStop = 3;
 
         [InputParameter("Points above Order Price")]
         public double PtsAbove = 0;
@@ -98,6 +103,9 @@ namespace Directional_Index_Trading
         public double pricePerTick = 0.5;
         [InputParameter("Minimum Tick SL")]
         public int minTicks = 3;
+
+        [InputParameter("Daily Loss Decrease/Stop",minimum: 0,maximum: 5)]
+        public double LimDecrease;
 
         private HistoricalData _historicalSecData;
         public Indicator indicatorDMI;
@@ -135,7 +143,9 @@ namespace Directional_Index_Trading
         private double sOrders;
         private double PlOrders;
         private double PsOrders;
-        private DateTime TimeAfterPos;
+        private int DecreaseNum;
+        private DateTime Tomorrow;
+        private bool CircuitBreakerHit = false;
         private int Tradesat0Risk;
         #endregion Parameters
 
@@ -143,7 +153,6 @@ namespace Directional_Index_Trading
         public Directional_Index_Trading()
             : base()
         {
-            // Defines indicator's group, name and description.
             this.Name = "Buy/Sell on DMI";
             this.Description = "This strategy buys and sells when DMI flattens";
         }
@@ -155,7 +164,7 @@ namespace Directional_Index_Trading
             this.indicatorDMI = Core.Indicators.BuiltIn.DMI(Period2, MAType);
             this.indicatorATR = Core.Indicators.BuiltIn.ATR(Period2, MAType);
         }
-
+        
         protected override void OnRun()
         {
             CurrMaxRisk = maxRisk;
@@ -177,7 +186,7 @@ namespace Directional_Index_Trading
                 return;
             }
             Random rnd = new Random();
-            rndNum = RandomTime == true ? rnd.Next(85, 220) : CandleTime;
+            rndNum = RandomTime == true ? rnd.Next(30, 190) : CandleTime;
             _historicalSecData = symbol1.GetHistory( new HistoryAggregationHeikenAshi(HeikenAshiSource.Second, rndNum), HistoryType.Last ,DateTime.Now.AddMinutes(-30));
             
             _historicalSecData.AddIndicator(indicatorDMI);
@@ -187,7 +196,8 @@ namespace Directional_Index_Trading
 
             Core.TradeAdded += UpdateTime;
             trailPrice = slPrice; //Math.Ceiling(indicatorATR.GetValue(1)/3);
-            
+            Tomorrow = symbol1.LastDateTime.FromSelectedTimeZoneToUtc().AddDays(1).Date;
+            Core.PositionRemoved += Core_PositionRemoved;
             _historicalSecData.NewHistoryItem += this.historicalData_NewHistoryItem;
             Log("Strategy has began running");
             /*var timer = new System.Threading.Timer((e) =>
@@ -197,25 +207,50 @@ namespace Directional_Index_Trading
             Log(symbol1.TickSize.ToString());
         }
 
-        private void UpdateTime(Trade pos)
+        private void Core_PositionRemoved(Position pos)
+        {
+            if (account.Balance <= ((100 - LimMax) / 100) * startAccVal)
+            {
+                Log("Account Value exceeds daily loss limit", StrategyLoggingLevel.Error);
+                CircuitBreakerHit = true;
+                
+                LowMovementBegin = symbol1.LastDateTime.FromSelectedTimeZoneToUtc(); // Cuts off trading until next day
+                startAccVal = account.Balance;
+                LimMax -= LimDecrease;
+                DecreaseNum++;
+                return;
+            }
+            
+        }
+
+        private void UpdateTime(Trade pos) // Will not work if given a set time, as LowMovementFinish will change to a later date.
         {
             var symbLast = symbol1.LastDateTime.FromSelectedTimeZoneToUtc();
-            LowMovementBegin = new DateTime(symbLast.Year, symbLast.Month, symbLast.Day, 20, 30, 0);
-            LowMovementFinish = LowMovementBegin.Add(new TimeSpan(11, 15, 0));
+            
+            LowMovementBegin = (symbLast.DayOfWeek == DayOfWeek.Friday ? new DateTime(symbLast.AddDays(2).Year, symbLast.AddDays(2).Month, symbLast.AddDays(2).Day, 20, 30, 0) : new DateTime(symbLast.Year, symbLast.Month, symbLast.Day, 20, 30, 0));
+            LowMovementFinish = LowMovementBegin.Add(new TimeSpan(hoursWithoutTrading,0, 0));
+            CircuitBreakerHit = false;
             ChangeLStreak(pos);
-            Log("Final Account Value: " + account.Balance);
+            
         }
 
 
         private void historicalData_NewHistoryItem(object sender, HistoryEventArgs e)
         {
+            
             numBars++;
-            if (account.Balance <= ((100-LimMax)/100) * startAccVal)
+            /*if (LimMax <= 0)
             {
-                Log("Account Value exceeds daily loss limit");
                 Stop();
+            }*/
+            if ((CircuitBreakerHit == true && LimMax <= 3.5) /*|| (symbol1.LastDateTime.FromSelectedTimeZoneToUtc().Date > Tomorrow && CircuitBreakerHit == false)*/)
+            {
+                Log("Resetting Daily Stop Loss");
+                LimMax += DecreaseNum * LimDecrease;
+                DecreaseNum = 0;
+                CircuitBreakerHit = false;
+                Tomorrow = symbol1.LastDateTime.FromSelectedTimeZoneToUtc().AddDays(symbol1.LastDateTime.FromSelectedTimeZoneToUtc().DayOfWeek == DayOfWeek.Friday ? 2 : 1).Date;
             }
-
             StrategyProcess();
 
         }
@@ -235,7 +270,7 @@ namespace Directional_Index_Trading
                 }
             }
 
-            if (Math.Round(indicatorDMI.GetValue(1, 0), 5) == Math.Round(indicatorDMI.GetValue(2, 0), 5) && Math.Round(indicatorDMI.GetValue(1, 1), 5) == Math.Round(indicatorDMI.GetValue(2, 1), 5))
+            if (Math.Round(indicatorDMI.GetValue(1, 0), 4) == Math.Round(indicatorDMI.GetValue(2, 0), 4) && Math.Round(indicatorDMI.GetValue(1, 1), 4) == Math.Round(indicatorDMI.GetValue(2, 1), 4))
             {
                 prevHigh = ((HistoryItemBar)_historicalSecData[1]).High;
                 prevHigh2 = ((HistoryItemBar)_historicalSecData[2]).High;
@@ -246,7 +281,7 @@ namespace Directional_Index_Trading
                 {
 
                     Log("Positions > 0");
-                    if (Core.Positions.Length > 1)
+                    if (Core.Positions.Length > 2)
                     {
                         Log("Error: Too many positions opened", StrategyLoggingLevel.Error);
                         Stop();
@@ -285,7 +320,7 @@ namespace Directional_Index_Trading
                     
                 }
                 
-                if (prevHigh2 > prevHigh && (((HistoryItemBar)_historicalSecData[1]).Close - ((HistoryItemBar)_historicalSecData[1]).Open) > 0 && (((HistoryItemBar)_historicalSecData[2]).Close - ((HistoryItemBar)_historicalSecData[2]).Open > 0))
+                if ( (TradeDir == 0 || TradeDir == 2) && prevHigh2 > prevHigh && (((HistoryItemBar)_historicalSecData[1]).Close - ((HistoryItemBar)_historicalSecData[1]).Open) > 0 && (((HistoryItemBar)_historicalSecData[2]).Close - ((HistoryItemBar)_historicalSecData[2]).Open > 0))
                 {
                     if (symbol1.LastDateTime.FromSelectedTimeZoneToUtc() < LowMovementBegin || symbol1.LastDateTime.FromSelectedTimeZoneToUtc() > LowMovementFinish)
                     {
@@ -293,7 +328,7 @@ namespace Directional_Index_Trading
                     }
                     
                 }
-                else if (prevLow2 < prevLow && (((HistoryItemBar)_historicalSecData[1]).Close - ((HistoryItemBar)_historicalSecData[1]).Open) < 0 && (((HistoryItemBar)_historicalSecData[2]).Close - ((HistoryItemBar)_historicalSecData[2]).Open < 0))
+                else if ((TradeDir == 0 || TradeDir == 1) && prevLow2 < prevLow && (((HistoryItemBar)_historicalSecData[1]).Close - ((HistoryItemBar)_historicalSecData[1]).Open) < 0 && (((HistoryItemBar)_historicalSecData[2]).Close - ((HistoryItemBar)_historicalSecData[2]).Open < 0))
                 {
                     if (symbol1.LastDateTime.FromSelectedTimeZoneToUtc() < LowMovementBegin || symbol1.LastDateTime.FromSelectedTimeZoneToUtc() > LowMovementFinish)
                     {
@@ -312,7 +347,11 @@ namespace Directional_Index_Trading
 
         public void CreateLimitOrder(Side side, bool isReversal, double Amm = 0)
         {
-            
+            if (CircuitBreakerHit && symbol1.LastDateTime.FromSelectedTimeZoneToUtc() < LowMovementFinish)
+            {
+                Log("Circuit Breaker hit inside CreateLimitOrder. Time: " + symbol1.LastDateTime.FromSelectedTimeZoneToUtc().ToString());
+                return;
+            }
 
             if (Tradesat0Risk > 3)
             {
@@ -353,9 +392,8 @@ namespace Directional_Index_Trading
             }
             var sign = (side == Side.Buy) ? -1 : 1;
             
-            //var orderPrice = (side == Side.Buy) ? symbol1.Bid : symbol1.Ask;
             double orderPrice;
-            orderPrice = (side == Side.Buy) ? symbol1.Bid : symbol1.Ask;
+            orderPrice = (side == Side.Buy) ? symbol1.Bid + sign * PtsAbove : symbol1.Ask + sign * PtsAbove;
             //orderPrice = Math.Round(((side == Side.Buy ? ((HistoryItemBar)_historicalSecData[1]).Low : ((HistoryItemBar)_historicalSecData[1]).High) + sign * x) * symbol1.TickSize, MidpointRounding.ToEven)/symbol1.TickSize;
             
 
@@ -369,14 +407,12 @@ namespace Directional_Index_Trading
             double Amount = 1; 
             //var tpPrice = orderPrice - sign * TP * symbol1.TickSize;
             Amount = Math.Ceiling(CurrMaxRisk * account.Balance / (100 * (slPrice/symbol1.TickSize) * pricePerTick));
+            
             if (Amount > Math.Floor(account.Balance/daym))
             {
                 Amount = Math.Floor(account.Balance / daym);
             }
-            Log(slPrice.ToString());
-            Log("Amount: " + Amount);
-            Log("indicator: " + indRounded);
-            Log("Min ticks: " + (minTicks * symbol1.TickSize));
+            
             if(Amount == 0)
             {
                 Log("Trading failed. 0 Amount size");
@@ -385,40 +421,37 @@ namespace Directional_Index_Trading
             var StopL = SlTpHolder.CreateSL(slPrice, PriceMeasurement.Offset);
             var TakeP = SlTpHolder.CreateTP(slPrice/symbol1.TickSize < 30 ? y * slPrice : 2 * slPrice, PriceMeasurement.Offset);
 
-            Log("TP: " + (slPrice / symbol1.TickSize < 20 ? y * slPrice : 2 * slPrice));
-            /*
-            if((side == Side.Sell && orderPrice < symbol1.Last) || (side == Side.Buy && orderPrice > symbol1.Last))
-            {*/
+            if (Amount / 10 >= 1)
+            {
                 _operationResult = Core.Instance.PlaceOrder(new PlaceOrderRequestParameters
                 {
                     Account = this.account,
-                    Symbol = this.symbol1,
+                    Symbol = this.symbol2,
                     Side = side,
                     Price = orderPrice,
-                    Quantity = Amount,
+                    Quantity = Math.Floor(Amount/10),
                     TimeInForce = TimeInForce.GTT,
                     ExpirationTime = DateTime.Now.AddMinutes(MaxBars * _historicalSecData.Period.Duration.TotalMinutes),
                     StopLoss = StopL,
                     TakeProfit = TakeP,
                     OrderTypeId = OrderType.Limit
                 });
-            /*} else
+                Amount = Amount % 10;
+
+            }
+            _operationResult = Core.Instance.PlaceOrder(new PlaceOrderRequestParameters
             {
-                _operationResult = Core.PlaceOrder(new PlaceOrderRequestParameters
-                {
-                    Account = account,
-                    Symbol = symbol1,
-                    Side = side,
-                    Quantity = Amount,
-                    StopLoss = StopL,
-                    TakeProfit = TakeP,
-                    OrderTypeId = OrderType.Market
-                });
-                if (_operationResult.Status == TradingOperationResultStatus.Success)
-                    orderPrice = Core.Positions[0].OpenPrice;
-                else
-                    Log("Error while opening market position. " + _operationResult.Message, StrategyLoggingLevel.Error);
-            }*/
+                Account = this.account,
+                Symbol = this.symbol1,
+                Side = side,
+                Price = orderPrice,
+                Quantity = Amount,
+                TimeInForce = TimeInForce.GTT,
+                ExpirationTime = DateTime.Now.AddMinutes(MaxBars * _historicalSecData.Period.Duration.TotalMinutes),
+                StopLoss = StopL,
+                TakeProfit = TakeP,
+                OrderTypeId = OrderType.Limit
+            });
 
             
             trailPrice = Math.Round(orderPrice + sign * slPrice, MidpointRounding.ToEven);
@@ -437,7 +470,7 @@ namespace Directional_Index_Trading
                 sOrders++;
             }
             if (_operationResult.Status == TradingOperationResultStatus.Success)
-                Log($"{_operationResult.Message}. {formattedSide} order was placed @ {orderPrice}.", StrategyLoggingLevel.Trading);
+                Log($"{_operationResult.Status}. {formattedSide} order was placed @ {orderPrice}.", StrategyLoggingLevel.Trading);
             if(_operationResult.Status == TradingOperationResultStatus.Failure)
             {
                 Log($"{_operationResult.Message}. {formattedSide} order failed to be placed @ {orderPrice}.", StrategyLoggingLevel.Error);
@@ -452,6 +485,13 @@ namespace Directional_Index_Trading
             if (Core.Positions.Length == 0)
             {
                 return;
+            }
+            if (symbol1.LastDateTime.FromSelectedTimeZoneToUtc() >= new DateTime(DateTime.UtcNow.Year, DateTime.UtcNow.Month, DateTime.UtcNow.Day, 8, 30,0))
+            {
+                foreach(Position pos in Core.Positions)
+                {
+                    pos.Close();
+                }
             }
             if (ChoiceofStop == 2 && symbol1.Last >= BEPtsAbove && aboveBE == false)
             {
@@ -478,7 +518,7 @@ namespace Directional_Index_Trading
                     if (result.Status == TradingOperationResultStatus.Success)
                     {
                         Log($"{result.Status}. Position was closed. See Line 351. Positions Left: " + Core.Positions.Length, StrategyLoggingLevel.Trading);
-                        Log("Account Final Balance: " + account.Balance);
+                        
                     }
                     else
                         Log($"{result.Message}. Position could not be closed. See Line 353", StrategyLoggingLevel.Error);
@@ -536,7 +576,7 @@ namespace Directional_Index_Trading
             result.Add("Random choice of seconds", rndNum.ToString());
             result.Add("Average Profit - Long", Math.Round(PlOrders / lOrders, 2).ToString());
             result.Add("Average Profit - Short", Math.Round(PsOrders / sOrders,2).ToString());
-
+            result.Add("Circuit Breaker hit: ", CircuitBreakerHit.ToString());
             return result;
         }
         public void ChangeLStreak(Trade pos)
@@ -563,6 +603,10 @@ namespace Directional_Index_Trading
                 else
                 {
                     PlOrders += pos.GrossPnl.Value;
+                }
+                if(startAccVal < account.Balance)
+                {
+                    startAccVal = account.Balance;
                 }
                 lossStreak = 0;
                 CurrMaxRisk = maxRisk;
